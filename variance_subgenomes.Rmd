@@ -1,0 +1,1218 @@
+---
+title: "Variance Components for M1 and M2"
+author: "Simon Renny-Byfield"
+date: "January 18, 2016"
+output: html_document
+---
+
+#Introduction
+
+The aim of this document is to describe and detail the methods used in Renny-Byfield, Rodgers-Melnick and Ross-Ibarra 2016. Briefly, this paper compares variance components for SNPs in the two sub-genomes of maize and investigates some of the prevailing theories of duplicate gene retention commonly described in the literature. 
+
+The idea is to be examine if one of the sub-genomes is really more degenerate than the other, as SNP and gene expression data suggest. An indication of this "degenerancy" would be that SNPs in maize2 (the more fractionated of the sub-genomes) have a smaller mean effect size, whereas SNPs on the more intact genome (maize1) have, on average, larger effect sizes.
+
+The two subgenomes of maize have already been described by others, and so that data is readily available. Using the positions of genes in maize1 and maize2 I will generate kinship matrices from SNPs in those genes. Using the AHTP pipeline from the Buckler lab I will then compare the explanitory power of maize1 and maize2 kinship matrices in describing variation in 45 traits measured in the NAM population of maize lines ad part of the $Panzea$ project. 
+
+# Methods
+
+The first step is to do a simple analysis of maize1 vs maize2. 
+
+##Stage 1: Parse and load in the neccesary data
+
+Using the genotype data available on Panzea, we passed genetype data into SNP frequency information usingthe following perl script:
+
+```{}
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+#######################################################
+# A brief script to calculate MAF from genotype files #
+# 				from maize NAM lines				  #
+#######################################################
+
+# usage script.pl <file>
+
+# Simon Renny-Byfield, UC Davis November 24th 2015
+
+# version 1
+
+# load in modules
+use List::Util 'sum';
+
+# a global variable
+my @outArray;
+
+############
+# Main	   #
+############
+
+# set up the file handle
+
+open ( IN , $ARGV[0] ) || die "Could not open file $ARGV[0]: $!\n";
+
+# cycle through the file
+
+while ( <IN> ) {
+	chomp;
+	# assume the header line contains #
+ 	if ( m/#/ ) {
+ 		# add the last column header for the new data to be added
+ 		print $_ , "\t" , "MAF\n";
+ 	}# if
+ 	else {
+ 		# split the data by NA
+ 		my @data = split /NA/;
+ 		# $data[0] is the chromosome info
+ 		# $data[6] is all the SNP calls
+ 		
+ 		# first find the alleles that are present.
+ 		my @chromInfo = split /\t/ , $data[0];
+ 		my @alleles = split /\// , $chromInfo[1];
+ 		# replace + and - with N
+ 		for(@alleles){s/[+-]/N/g}
+ 		# skip lines with multiple, or undef alleles
+ 		if ( grep( /N/ , @alleles ) or scalar @alleles > 2 ) {
+ 			print $_ , "\tNA\n";
+ 			next;
+ 		}# if
+ 		my %counts;	
+		# for each allele count the number of occurrences
+		for my $allele ( @alleles ) {
+			my @c = $data[6] =~ m/$allele/g;
+			my $count = @c;
+			#print $allele , "\t" , $count , "\t";
+			$counts{$allele} = $count;
+		}# foreach
+		# the sum of all allele counts
+		my $total_count = sum values %counts;
+		#print "$total_count\t";
+		my $MAF = $counts{$alleles[1]}/$total_count;
+		print $_ , "\t$MAF\n";
+ 	}# else
+}# while
+
+exit;
+
+```
+
+Importantly, at this point we discarded SNPs that are triallelic.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+################################
+# Load in some useful packages #
+################################
+
+library(data.table)
+library(GenomicRanges)
+library(scales)
+library(plyr)
+library(ggplot2)
+library(grid)
+library(Hmisc)
+library(rtracklayer)
+library(gridExtra)
+library(zoo)
+library(reshape)
+library(car)
+library(FSA)
+
+###########################################
+# Now load in the gff and sub-genome data #
+###########################################
+
+gff<-import.gff("/Users/simonrenny-byfield/maize_genome/Zea_mays.AGPv3.22_primary_transcripts_name.gff")
+gff$name<-gff$group
+
+# add in the maize1  and maize2
+# prepare the GRanges object to receive the sub-genome info
+values(gff)$sub.genome<-"no syn"
+
+# load in the maize1 maize 2 subgenomes info
+subGenomes<-read.csv("/Users/simonrenny-byfield/GitHubRepos/custom_cnv/data/gene_by_sugenome.csv",na.strings=c("",".","NA"), header= F)
+
+# attribute the correct sub-genome to each annotation
+values(gff)$sub.genome[gff$name %in% subGenomes[,2]]<-"M1"
+values(gff)$sub.genome[gff$name %in% subGenomes[,3]]<-"M2"
+
+################################
+# Load in the SNP data for NAM #
+################################
+
+# thie SNP data will allow me to see how many SNPs are in each of maize1 and maize2
+# devide the SNPs up into group based on MAF in NAM, might use this later to control for frequency
+
+# load in the SNP data
+NAM_snps<-fread("/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/data/nam_snp_MAF_table.txt",showProgress=F)
+
+# re-assign names
+names<-c("rs","alleles", "chrom",   "pos", "MAF")
+setnames(NAM_snps,names(NAM_snps),names)
+
+# remove unwanted columns
+NAM_snps[ ,`:=`(rs = NULL, alleles = NULL)]
+NAM_snps$end<-NAM_snps$pos
+
+# reo-order and rename
+setcolorder(NAM_snps,c("chrom","pos","end","MAF"))
+setnames(NAM_snps,c("chr","start","end","MAF"))
+
+# remove the NA fields, they are bad calls and we do not need them
+NAM_snps<-na.omit(NAM_snps)
+
+# convert to GRanges object
+NAM_snps<-as(as.data.frame(NAM_snps), "GRanges")
+
+# group SNPs based on MAF
+NAM_snps$MAFgroup<-cut2(NAM_snps$MAF, cuts=seq(0,0.5,by=0.05))
+
+# report some statistics about the SNP information
+
+print(paste0("There are a total of ", dim(as(NAM_snps,"data.frame"))[1]," SNPs"))
+```
+
+##Stage 2: Output a bed file for maize1 and maize2 regions
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+#######################
+# Output the bed file #
+#######################
+
+# maize1 bed file
+maize1bed<-as.data.frame(subset(gff,subset=sub.genome=="M1" & type == "gene"))[,1:3]
+# maize2 bed file
+maize2bed<-as.data.frame(subset(gff,subset=sub.genome=="M2" & type == "gene"))[,1:3]
+# rest of the genome
+restOfGenomeM1M2<-as.data.frame(gaps(as(rbind(maize1bed,maize2bed),"GRanges")))[,1:3]
+
+# write the output to a file
+write.table(maize1bed,quote=F, sep="\t", row.names=F, col.names=F, file = "maize1.bed")
+write.table(maize2bed,quote=F, sep="\t", row.names=F, col.names=F, file = "maize2.bed")
+write.table(restOfGenomeM1M2,quote=F, sep="\t", row.names=F, col.names=F, file = "restOfGenomeM1M2.bed")
+
+####
+# Report how many SNPs in each category
+####
+
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(maize1bed,"GRanges")),"data.frame"))[1]," SNPs in maize 1"))
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(maize2bed,"GRanges")),"data.frame"))[1]," SNPs in maize 2"))
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(restOfGenomeM1M2,"GRanges")),"data.frame"))[1]," SNPs in the rest of the genome"))
+
+```
+
+Next, we need to control somewhat for the difference in the size of maize1 and maize2. Maize1 is larger, and therefore you might expect it to account for more variance, whene compared with the smaller maize2 sub-genome. This issue is somewhat dealt with by looking at the variance explained by syntenic paralogs in maize1 and maize2, that is only genes with copies in both maize1 and maize2 are assessed for their contribution to additive genetic variance (each of the maize1/maize2 categories will have the same number of genes). 
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+################################################################
+# Output maize1 and maize2 syntenic orthologs (MUST BE PAIRED) #
+################################################################
+
+# remove non syntenic maize1 and maize2 genes
+synPairs<-na.omit(subGenomes)
+
+# remove pairs that are not in the gff file, to keep it neat
+synPairs<-synPairs[synPairs$V2 %in% gff$name[gff$type=="gene"] & synPairs$V3 %in% gff$name[gff$type=="gene"],]
+
+# maize1 bed file, syntenic paralog pairs only
+maize1Synbed<-as.data.frame(subset(gff,subset=name %in% synPairs$V2  & type == "gene"))[,1:3]
+# maize1 bed file, syntenic paralog pairs only
+maize2Synbed<-as.data.frame(subset(gff,subset=name %in% synPairs$V3  & type == "gene"))[,1:3]
+
+# generate a "rest of the genome" bedfile
+restOfGenomeM1M2Syn<-as.data.frame(gaps(as(rbind(maize1Synbed,maize2Synbed),"GRanges")))[,1:3]
+
+# write the output to a file
+write.table(maize1Synbed,quote=F, sep="\t", row.names=F, col.names=F, file = "maize1Syn.bed")
+write.table(maize2Synbed,quote=F, sep="\t", row.names=F, col.names=F, file = "maize2Syn.bed")
+write.table(restOfGenomeM1M2Syn,quote=F, sep="\t", row.names=F, col.names=F, file = "restOfGenomeM1M2Syn.bed")
+
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(maize1Synbed,"GRanges")),"data.frame"))[1]," SNPs in syntenic maize 1 genes"))
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(maize2Synbed,"GRanges")),"data.frame"))[1]," SNPs in syntenic maize 2 genes"))
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(restOfGenomeM1M2Syn,"GRanges")),"data.frame"))[1]," SNPs in the rest of the genome"))
+```
+
+##Stage 3: Generate a Kinship Matrix
+
+The script below will generate a kinship matrix usign the VCAP pipeline from Buckler's lab. The kinship matrices will then be used to examine how well each of these matrices predicts variaition in phenotype.
+
+```{}
+#!/bin/bash -l
+#SBATCH --exclude=bigmem1,bigmem2
+#SBATCH -D /group/jrigrp4/cnvwin/AHTP/subgenomes/relationshipMatrix
+#SBATCH -o /group/jrigrp4/cnvwin/AHTP/logs/matrix_out_log-%j.txt
+#SBATCH -e /group/jrigrp4/cnvwin/AHTP/logs/matrix_err_log-%j.txt
+#SBATCH -J matrix
+#SBATCH --mem-per-cpu=65000
+#SBATCH --cpus-per-task=1
+#SBATCH --array=1-2
+##Simon Renny-Byfield, UC Davis, November 2015
+
+# load in the files from ls
+cd ../bedFiles
+file=$(head -n $SLURM_ARRAY_TASK_ID ../bedFiles/bed.file.list | tail -n1 )
+cd ../relationshipMatrix
+
+echo "Starting Job: $file"
+date
+
+module load java
+
+cmd="run_pipeline.pl -Xmx64g -importGuess ../../genotypes/namrils_projected_hmp31_MAF02mnCnt2500.hmp.txt.gz -FilterSiteBuilderPlugin -bedFile ../bedFiles/$file -endPlugin -KinshipPlugin -method Scaled_IBS -endPlugin -RemoveNaNFromDistanceMatrixPlugin -endPlugin -export kinship_$file -exportType SqrMatrixBin"
+
+echo $cmd
+eval $cmd
+
+#sleep 60
+
+echo "Ending Job: "
+date
+
+
+```
+
+##Stage 4: Run LDAK using the Maize1 and Maize2 kinship matrices
+
+The next step is LDAK and get heritability estimates for each of maize1 ans maize2 SNPs.
+
+```{}
+#!/bin/bash
+#SBATCH -D /group/jrigrp4/cnvwin/AHTP/subgenomes/relationshipMatrix
+#SBATCH -o /group/jrigrp4/cnvwin/AHTP/logs/LDAK_out_log-%j.txt
+#SBATCH -e /group/jrigrp4/cnvwin/AHTP/logs/LDAK_err_log-%j.txt
+#SBATCH -J LDAK
+#SBATCH --mem-per-cpu=10000
+#SBATCH --cpus-per-task=1
+#SBATCH --array=1-45
+
+##Simon Renny-Byfield, UC Davis, December  2015
+
+pheno=$(head -n $SLURM_ARRAY_TASK_ID ../../phenotypes/file_list | tail -n1)
+
+echo "Starting Job: "
+date
+
+cmd="ldak.4.9 --reml ../results/results_m1_vs_m2_$pheno --mgrm m1_vs_m2_list --pheno ../../phenotypes/$pheno --kinship-details NO"
+echo $cmd
+eval $cmd
+
+echo "Ending Job: "
+date
+```
+
+Next we need to parse the results, extract the information we need and plot the data. Firstly, the following perl script was used to extract heritability values for each of maize1 and maize2 for the 45 phenotypes.
+
+```{}
+#!usr/bin/perl
+use strict;
+use warnings;
+
+# Simon Renny-Byfield, UC Davis December 2015
+
+# usage script.pl <dir> 
+
+# extract heritability from .reml files produced by AHTP
+
+opendir DIR, $ARGV[0] or die "cannot open dir $ARGV[0]: $!";
+my @files= readdir DIR;
+closedir DIR;
+
+# filter out the files that aren't NAM
+@files=grep(/NAM/, @files );
+# now we need only the reml output
+@files=grep(/reml/, @files);
+
+# print a header line
+print "pheno\tSNP_freq\tCNV_freq\tgroup\theritability\tsd\n";
+
+# for each of the files, grab the relavent data to fill out the table
+
+foreach my $file ( @files ) {
+	open (FH, "<$ARGV[0]/$file" ) || die ;
+	my @data= <FH>;
+	$file =~ s/results_//g;
+	$file =~ s/_multiblup.txt.reml//g;
+	$file =~ m/(m1_vs_m2)_NAM_(.+)/;
+	my $pheno = $2;
+	my $status = $1;
+	$status =~ s/__/,/;
+	$status = "[".$status.")";
+	chomp $data[10];
+	chomp $data[11];
+	$data[10] =~ s/\s+/\t/g;
+	$data[11] =~ s/\s+/\t/g;
+	print $pheno, "\t", $status , "\t" , "M1" , "\t",  $data[10] , "\n";
+	print $pheno, "\t", $status , "\t" , "M2" , "\t",  $data[11] , "\n";
+}# foreach
+
+exit;
+```
+
+##Stage 5: Correct heritability for number of SNPs in each subgenome (NOT NEEDED NOW)
+
+Now load in the data, and correct for the number of SNPs in each category. Additioanlly, perform a t-test using the mean and standard deviations from the variance components estimates. 
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE, eval=FALSE}
+
+#######################################
+# Load in the variance component data #
+#######################################
+
+# load in the data
+m1m2.dt<-fread("/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/results/m1_vs_m2_heritability.txt")
+
+# add the number of snps to each group
+m1m2.dt$SNP_num<-"NA"
+m1m2.dt$SNP_num[m1m2.dt$sub.genome=="M1"]<-as.numeric(maize1Total)
+m1m2.dt$SNP_num[m1m2.dt$sub.genome=="M2"]<-as.numeric(maize2Total)
+m1m2.dt$SNP_num<-as.numeric(m1m2.dt$SNP_num)
+m1m2.dt$correctedH<-m1m2.dt$heritability
+m1m2.dt$correctedH[m1m2.dt$sub.genome=="M2"]<-m1m2.dt$heritability[m1m2.dt$sub.genome=="M2"]*(maize1Total/maize2Total)
+#m1m2.dt[,"correctedSD" := NULL]
+
+##########################################################
+# Source a function for a t-test using sample statistics #
+##########################################################
+
+# source the function
+source("/Users/simonrenny-byfield/GitHubRepos/cnvwin/scripts/t.test2.R")
+
+# perform the t-test per m1, m2 pair usinf value, sd, and a sample size
+pvals<-NULL
+cols<-NULL
+size<-2
+#loop over the pairs
+for ( i in seq(1,dim(m1m2.dt)[1]-1,by=2) ) {
+  pvals<-c(pvals,as.numeric(t.test2(m1m2.dt$correctedH[i],m1m2.dt$correctedH[i+1],
+                m1m2.dt$sd[i],m1m2.dt$sd[i+1],size,size))[4])
+  if (m1m2.dt$correctedH[i] > m1m2.dt$correctedH[i+1]) {
+    cols<-c(cols,"blue")
+  }# if
+  else {
+    cols<-c(cols,"red")
+  }
+}# for
+
+# add the pvals to the data.table
+m1m2.dt$label<-"*"
+m1m2.dt$col<-as.vector(rbind(cols,cols))
+m1m2.dt$pvals<-as.vector(rbind(pvals,pvals))
+
+```
+
+# Variance Components Results
+
+The results here a multi-faceted and include:
+
+* All of maize1
+* All of mazie2
+
+* genes with syntenic paralogs in maize1
+* ditto for mazie2
+
+## Maize1 vs Maize2 (ALL genes)
+
+Firstly, lets plot the results from maize1 and maize2, for all genes regardless of if the genes are maintained in duplicate. For these results then number of genes, and presumably the number of SNPs varies. 
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+#######################################
+# Load in the variance component data #
+#######################################
+
+# load in the data
+m1m2.dt<-fread("/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/results/m1_vs_m2_heritability.txt")
+
+# find  which traits have greater than 40% heritability
+totalH<-aggregate(m1m2.dt$heritability,by=list(m1m2.dt$pheno), "sum")
+traits<-totalH$Group.1[totalH$x >= 0.4]
+
+# output a file for supp info with heritability estimates for each trait
+
+suppInfo1<-totalH[rev(order(totalH$x)),]
+colnames(suppInfo1)<-c("trait","heritability")
+
+write.table(suppInfo1, quote=F, 
+        sep="\t", row.names=F,file="/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/results/suppInfo1.txt")
+
+limits <- aes(ymax = heritability + sd*1.96, ymin=heritability - sd*1.96)
+
+ggplot(data=subset(m1m2.dt,sub.genome != "rest" & pheno %in% traits),aes(y = heritability, x= sub.genome, colour=sub.genome))+
+  facet_wrap(~pheno, ncol = 5,scales = "free")+
+  theme_bw()+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_errorbar(limits, size=0.9, width = 0.1, colour="black")+
+  geom_point(size=3)+
+  geom_point(size=2, colour="white")+
+  xlab("subgenome")+
+  ylab("Heritability")+
+  scale_colour_manual(values=c("blue","red"),labels=c("maize 1","maize 2"))+
+  #geom_text(aes(label="*", 
+  #          x=-Inf, y=Inf, hjust=-0.2, vjust=1.2),size=10,subset = .(pvals <= 0.05),colour=col)+
+  theme(axis.title.x = element_text(size=17),
+          axis.title.y = element_text(size=15),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size=8),
+          legend.position="top",
+          legend.key.size=unit(0.8,"cm"),
+          legend.text=element_text(size=15),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0.5, 1, 0.5, 4), "mm"), #top, right, bottom, left
+          panel.margin = unit(c(0.1, 0.5, 0.1, 1), "mm")
+          )
+```
+
+Use a binomial test to differentiante between a random or bias number of wins, for the whole dataset fo 45 traits:
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+# the number of "wins"
+succeses<-m1m2.dt$heritability[m1m2.dt$sub.genome == "M1"]-m1m2.dt$heritability[m1m2.dt$sub.genome == "M2"] > 0
+succeses<-length(succeses[succeses == TRUE])
+# perform the binomial test
+print(binom.test(succeses,45,p=0.5))
+```
+
+Now, do the same binomail test, but this time use only those traits which have heritability estimates greater than 40%.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+# now for only the traits with the most additive genetic variance. 
+succeses<-m1m2.dt$heritability[m1m2.dt$sub.genome == "M1" & m1m2.dt$pheno %in% traits ]-m1m2.dt$heritability[m1m2.dt$sub.genome == "M2" & m1m2.dt$pheno %in% traits] > 0
+succeses<-length(succeses[succeses == TRUE])
+# perform the binomial test
+print(binom.test(succeses,length(m1m2.dt$heritability[m1m2.dt$sub.genome == "M1" & m1m2.dt$pheno %in% traits ]),p=0.5))
+```
+
+Next, output a pdf of all the phenotypes, so readers can inspect individual traits of choice.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+pdf("m1_vs_m2.pdf",onefile = TRUE)
+par(mfrow=c(3,1))
+for ( i in unique(m1m2.dt$pheno) ) {
+  
+  p1<-ggplot( subset(m1m2.dt,subset=pheno==i) , aes(y = heritability, x= sub.genome, colour=sub.genome)) +
+  theme_bw()+
+  geom_errorbar(limits, size=1.3, width = 0.05, colour="black")+
+  geom_point(size=10)+
+  geom_line()+
+  xlab("subgenome")+
+  ylab("Total Heritability")+
+  labs(title = i)+
+  #geom_errorbar(limits, position="dodge", width=0.05)+
+  scale_colour_manual(values=c("blue","red"))+
+  theme(axis.title.x = element_text(size=15,vjust=-0.3),
+          axis.title.y = element_text(size=15,vjust=1.2),
+          axis.text.x = element_text(size=15),
+          axis.text.y = element_text(size=15),
+          legend.position="none")
+}
+dev.off()
+```
+
+## Maize1 vs Maize2 (syntenic paralogs ONLY)
+
+Next, we turn to analysing maize1 and maize2, but only considering the genes with syntenic paralogs in both maize1 and mazie2. For each category, there are the same number of genes. We hope that this will ameliorate the problem of maize1 being larger than maize2.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+#######################################
+# Load in the variance component data #
+#######################################
+
+# load in the data
+m1m2.dt<-fread("/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/results/m1_vs_m2_heritability_Syn.txt")
+
+# find  which traits have greater than 40% heritability
+totalH<-aggregate(m1m2.dt$heritability,by=list(m1m2.dt$pheno), "sum")
+traits<-totalH$Group.1[totalH$x >= 0.4]
+
+traits40<-totalH$Group.1[totalH$x >= 0.4]
+
+limitedTraits<-traits[c(1,6,7,8,11,12,13,16,17,18,26,21,28,24,30)]
+
+limits <- aes(ymax = heritability + sd*1.96, ymin=heritability - sd*1.96)
+
+ggplot(data=subset(m1m2.dt,sub.genome != "rest" & pheno %in% traits),aes(y = heritability, x= sub.genome, colour=sub.genome))+
+  facet_wrap(~pheno, ncol = 5,scales = "free")+
+  theme_bw()+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_errorbar(limits, size=1, width = 0.1, colour="black")+
+  geom_point(size=4)+
+  geom_point(size=2.5, colour="white")+
+  xlab("subgenome")+
+  ylab("Heritability")+
+  scale_colour_manual(values=c("blue","red"),labels=c("maize 1","maize 2"))+
+  #geom_text(aes(label="*", 
+  #          x=-Inf, y=Inf, hjust=-0.2, vjust=1.2),size=10,subset = .(pvals <= 0.05),colour=col)+
+  theme(axis.title.x = element_text(size=17),
+          axis.title.y = element_text(size=15),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size=8),
+          legend.position="top",
+          legend.key.size=unit(0.8,"cm"),
+          legend.text=element_text(size=15),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0.5, 1, 0.5, 4), "mm"), #top, right, bottom, left
+          panel.margin = unit(c(0.1, 0.5, 0.1, 1), "mm")
+          )
+
+```
+
+Now, plot a figure of selected traits suitable for publication.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+ggplot(data=subset(m1m2.dt,sub.genome != "rest" & pheno %in% limitedTraits),aes(y = heritability, x= sub.genome, colour=sub.genome))+
+  facet_wrap(~pheno, ncol = 5,scales = "free")+
+  theme_bw()+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_errorbar(limits, size=1, width = 0.1, colour="black")+
+  geom_point(size=4)+
+  geom_point(size=2.5, colour="white")+
+  xlab("")+
+  ylab("Heritability")+
+  scale_colour_manual(values=c("blue","red"),labels=c("maize 1","maize 2"))+
+  #geom_text(aes(label="*", 
+  #          x=-Inf, y=Inf, hjust=-0.2, vjust=1.2),size=10,subset = .(pvals <= 0.05),colour=col)+
+  theme(axis.title.x = element_text(size=17),
+          axis.title.y = element_text(size=15),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size=8),
+          legend.position="top",
+          legend.key.size=unit(0.8,"cm"),
+          legend.text=element_text(size=15),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0.5, 1, 0.5, 4), "mm"), #top, right, bottom, left
+          panel.margin = unit(c(0.1, 0.5, 0.1, 1), "mm")
+          )
+```
+
+Next, we perform a binomial test to examine if there is a differences between the number of traits that are better explained by m1 vs m2 (i.e. are maize1 and maize2 equal in terms of explaining H). A p-value below 0.05 would indicate that there is NOT a 50:50 chance of each sub-genome "winning", i.e. one of the sub-genomes wins more often than random.
+
+First we perform a test using all the traits:
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+succeses<-m1m2.dt$heritability[m1m2.dt$sub.genome == "M1"]-m1m2.dt$heritability[m1m2.dt$sub.genome == "M2"] > 0
+succeses<-length(succeses[succeses == TRUE])
+
+print(binom.test(succeses,45,p=0.5))
+```
+
+Next, only those traits with greater than 40% heritability.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+succeses<-m1m2.dt$heritability[m1m2.dt$sub.genome == "M1" & m1m2.dt$pheno %in% traits ]-m1m2.dt$heritability[m1m2.dt$sub.genome == "M2" & m1m2.dt$pheno %in% traits] > 0
+succeses<-length(succeses[succeses == TRUE])
+
+print(binom.test(succeses,length(m1m2.dt$heritability[m1m2.dt$sub.genome == "M1" & m1m2.dt$pheno %in% traits ]),p=0.5))
+```
+
+Let's analyse the data, but exclude traits where maize1 and mazie2 explain only a little $H^2$.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+# find  which traits have greater than 10% heritability, for m1 and m2 combined
+
+totalH<-aggregate(subset(m1m2.dt,subset=sub.genome %in% c("M1","M2"))$heritability,by=list(subset(m1m2.dt,subset=sub.genome %in% c("M1","M2"))$pheno), "sum")
+traits<-totalH$Group.1[totalH$x >= 0.1]
+
+# calculate the limits on the error bars
+limits <- aes(ymax = heritability + sd*1.96, ymin=heritability - sd*1.96)
+
+ggplot(data=subset(m1m2.dt,sub.genome != "rest" & pheno %in% traits),aes(y = heritability, x= sub.genome, colour=sub.genome))+
+  facet_wrap(~pheno, ncol = 5,scales = "free")+
+  theme_bw()+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_errorbar(limits, size=1, width = 0.1, colour="black")+
+  geom_point(size=3)+
+  geom_point(size=2, colour="white")+
+  xlab("subgenome")+
+  ylab("Heritability")+
+  scale_colour_manual(values=c("blue","red"),labels=c("maize 1","maize 2"))+
+  #geom_text(aes(label="*", 
+  #          x=-Inf, y=Inf, hjust=-0.2, vjust=1.2),size=10,subset = .(pvals <= 0.05),colour=col)+
+  theme(axis.title.x = element_text(size=17),
+          axis.title.y = element_text(size=15),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size=8),
+          legend.position="top",
+          legend.key.size=unit(0.8,"cm"),
+          legend.text=element_text(size=15),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0.5, 1, 0.5, 4), "mm"), #top, right, bottom, left
+          panel.margin = unit(c(0.1, 0.5, 0.1, 1), "mm")
+          )
+```
+
+No we perform a binomial test for only those traits that combine
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+succeses<-m1m2.dt$heritability[m1m2.dt$sub.genome == "M1" & m1m2.dt$pheno %in% traits ]-m1m2.dt$heritability[m1m2.dt$sub.genome == "M2" & m1m2.dt$pheno %in% traits] > 0
+succeses<-length(succeses[succeses == TRUE])
+
+print(binom.test(succeses,length(m1m2.dt$heritability[m1m2.dt$sub.genome == "M1" & m1m2.dt$pheno %in% traits ]),p=0.5))
+
+```
+
+What does mean heritability look like across the traits, and is there a statisitcal difference between maize1 and mazie2?
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+ggplot(data=subset(m1m2.dt,sub.genome != "rest" & pheno %in% traits40),aes(y = heritability, x= sub.genome, fill=sub.genome))+
+  theme_bw()+
+  geom_boxplot(alpha=0.9, size =1.4, colour="black")+
+  xlab("subgenome")+
+  ylab("Heritability")+
+  scale_fill_manual(values=c("blue","red"),labels=c("maize 1","maize 2"))+
+  #geom_text(aes(label="*", 
+  #          x=-Inf, y=Inf, hjust=-0.2, vjust=1.2),size=10,subset = .(pvals <= 0.05),colour=col)+
+      theme(axis.title.x = element_text(size=17),
+          axis.title.y = element_text(size=20),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size=20),
+          strip.text=element_text(size=20),
+          legend.position="top",
+          legend.key.size=unit(1.2,"cm"),
+          legend.text=element_text(size=15),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0.5, 1, 0.5, 4), "mm"), #top, right, bottom, left
+          panel.margin = unit(c(0.1, 0.5, 0.1, 1), "mm"),
+          panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+# looks normal but..
+hist(subset(m1m2.dt,sub.genome != "rest" & pheno %in% traits40 & heritability != 0)$heritability, 
+     breaks=15, col = "darkgrey",main="> 40% total hertitability", xlab="heritability")
+# test result indicates departure from normality.
+shapiro.test(subset(m1m2.dt,sub.genome != "rest" & pheno %in% traits40 & heritability != 0)$heritability)
+# not too much of a problem, becasue ANOVA can tolerate devaition from normality.
+
+```
+
+The data are not normal, so we need a non-parametric equivalent of a t-test, the Mann-Whitney-Wilcoxon test. Include only those traits where heritability is over 40%.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+wilcox.test(heritability~sub.genome,data=subset(m1m2.dt,sub.genome != "rest" & pheno %in% traits40 & heritability != 0))
+
+```
+
+Now try for any trait, regardless of heritability estimate
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+# looks normal but..
+hist(subset(m1m2.dt,sub.genome != "rest" & heritability != 0)$heritability, 
+      breaks=15, col = "darkgrey", main="All traits", xlab="heritability")
+# test result indicates departure from normality.
+shapiro.test(subset(m1m2.dt,sub.genome != "rest" & heritability != 0)$heritability)
+# not too much of a problem, becasue ANOVA can tolerate devaition from normality.
+
+wilcox.test(heritability~sub.genome,data=subset(m1m2.dt,sub.genome != "rest" & heritability != 0))
+
+```
+
+
+# Part 2: Expression of paralogs and variance components
+
+Current theory (see Schnable, Woodhouse and Freeling work) states that "lowley" expressed genes are invisible to natural selection. The assumption is that deleterious mutations are masked by the more highly expressed syntenic paralog when they occur in the lowley expressed gene. Such a process might allow degenrartion of the lowly expressed gene and eventaully deletion and or psuedogenization. A prediction of this theory is that SNPs in "lowely" expressed genes ought to contribute less phenotypic variance, when compared to highly expressed genes. This should be true regardless of sub-genome residency and makes a specific prediction: highly expressed genes should contribute more variance than their lowely expressed paralogs.
+
+## Methods
+
+### Up vs Down parlogs
+
+We have expression data from over 70 tissue in maize B73 available [here]("http://ftp.maizegdb.org/MaizeGDB/FTP/"), as well as the variance component piplines, and phenotypes of the maize NAM population. Now lets look at variance compoenents for highly and lowly exressed paralogs.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+###############################
+# Load in the expression data #
+###############################
+
+expAtlas<-fread("/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/expressionAtlas.txt",header=T)
+
+# for each gene, calculate the mean exression, and sd. Exclude the positional info of the gene
+expAtlas$mean<-rowMeans(subset(expAtlas, select=-c(1,2,3,4)),na.rm = TRUE)
+expAtlas$sd<-apply(subset(expAtlas, select=-c(1,2,3,4)),1, sd, na.rm = TRUE)
+
+
+# variable to hold gene names, one for up-regultated, one for down regulated.
+upRegulated<-NULL
+downRegulated<-NULL
+# for each paralog pair ....
+for ( i in 1:dim(na.omit(subGenomes))[1] ) {
+  m1Name<-na.omit(subGenomes)[i,2]
+  m2Name<-na.omit(subGenomes)[i,3]
+  m1<-expAtlas$mean[expAtlas$Maize_AGPv2_gene == m1Name ]
+  m2<-expAtlas$mean[expAtlas$Maize_AGPv2_gene == m2Name ]
+  if ( m1 > m2 ) {
+    upRegulated<-c(upRegulated,as.character(m1Name))
+    downRegulated<-c(downRegulated,as.character(m2Name))
+  }# if
+    if ( m2 > m1 ) {
+    upRegulated<-c(upRegulated,as.character(m2Name))
+    downRegulated<-c(downRegulated,as.character(m1Name))
+  }# if
+}# for
+
+# see how many genes are upregulatd from maize1 and maize2
+print(table(subset(gff,subset=name %in% upRegulated & type == "gene")$sub.genome))
+# ditto for down regulation
+print(table(subset(gff,subset=name %in% downRegulated & type == "gene")$sub.genome))
+
+# output a bed file for up and down regulated.
+write.table(as.data.frame(subset(gff,subset=name %in% upRegulated & type == "gene"))[,1:3],quote=F, 
+            sep="\t", row.names=F, col.names=F, file = "/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/upRegulatedParalogs.bed")
+write.table(as.data.frame(subset(gff,subset=name %in% downRegulated & type == "gene"))[,1:3],quote=F, 
+            sep="\t", row.names=F, col.names=F, file = "/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/downRegulatedParalogs.bed")
+
+# find the number of SNPs in the down-regulated and up-regulated genes
+
+numUpSNPs<-length(subsetByOverlaps(NAM_snps,subset(gff,subset=name %in% upRegulated & type == "gene")))
+numDownSNPs<-length(subsetByOverlaps(NAM_snps,subset(gff,subset=name %in% downRegulated & type == "gene")))
+
+```
+
+Exported bed files are then used to create a kinship matrix. The kinship matrix is them used to explain phenotypic variability over 45 phenotypes according to the `reml` method. The kinship matrix can be created with the following script, written for batch jobs:
+
+```{}
+#!/bin/bash -l
+#SBATCH --exclude=bigmem1,bigmem2
+#SBATCH -D /group/jrigrp4/cnvwin/AHTP/subgenomes/relationshipMatrix
+#SBATCH -o /group/jrigrp4/cnvwin/AHTP/logs/matrix_out_log-%j.txt
+#SBATCH -e /group/jrigrp4/cnvwin/AHTP/logs/matrix_err_log-%j.txt
+#SBATCH -J matrix
+#SBATCH --mem-per-cpu=65000
+#SBATCH --cpus-per-task=1
+#SBATCH --array=1-2
+##Simon Renny-Byfield, UC Davis, November 2015
+
+# load in the files from ls
+cd ../bedFiles
+file=$(head -n $SLURM_ARRAY_TASK_ID ../bedFiles/upDown.list | tail -n1 )
+cd ../relationshipMatrix
+
+echo "Starting Job: $file"
+date
+
+module load java
+
+cmd="run_pipeline.pl -Xmx64g -importGuess ../../genotypes/namrils_projected_hmp31_MAF02mnCnt2500.hmp.txt.gz -FilterSiteBuilderPlugin -bedFile ../bedFiles/$file -endPlugin -KinshipPlugin -method Scaled_IBS -endPlugin -RemoveNaNFromDistanceMatrixPlugin -endPlugin -export kinship_$file -exportType SqrMatrixBin"
+
+echo $cmd
+eval $cmd
+
+#sleep 60
+
+echo "Ending Job: "
+date
+```
+
+where `upDown.list` is a list of the associated `.bed` files that are generated above. 
+
+Following the creation of the kinship matices we can run LDAK to assess how each of these explains variance across 45 phenotypes. The following script can achieve this:
+
+```{}
+#!/bin/bash
+#SBATCH -D /group/jrigrp4/cnvwin/AHTP/subgenomes/relationshipMatrix
+#SBATCH -o /group/jrigrp4/cnvwin/AHTP/logs/LDAK_out_log-%j.txt
+#SBATCH -e /group/jrigrp4/cnvwin/AHTP/logs/LDAK_err_log-%j.txt
+#SBATCH -J LDAK
+#SBATCH --mem-per-cpu=10000
+#SBATCH --cpus-per-task=1
+#SBATCH --array=1-49
+
+##Simon Renny-Byfield, UC Davis, December  2015
+
+pheno=$(head -n $SLURM_ARRAY_TASK_ID ../../phenotypes/file_list | tail -n1)
+
+echo "Starting Job: "
+date
+
+cmd="ldak.4.9 --reml ../results/results_m1_vs_m2_$pheno --mgrm up_vs_Down_kinship_list --pheno ../../phenotypes/$pheno --kinship-details NO"
+echo $cmd
+eval $cmd
+
+echo "Ending Job: "
+date
+
+```
+
+Next, the data are parsed into a single dataset using the following perl script. In short, the script accesses the data, collates and prints to a single file:
+
+```{}
+#!usr/bin/perl
+use strict;
+use warnings;
+
+# Simon Renny-Byfield, UC Davis December 2015
+
+# usage script.pl <dir> 
+
+# extract heritability from .reml files produced by AHTP
+
+opendir DIR, $ARGV[0] or die "cannot open dir $ARGV[0]: $!";
+my @files= readdir DIR;
+closedir DIR;
+
+# filter out the files that aren't NAM
+@files=grep(/NAM/, @files );
+# now we need only the reml output
+@files=grep(/reml/, @files);
+
+# print a header line
+print "pheno\tSNP_freq\texpression\tgroup\theritability\tsd\n";
+
+# for each of the files, grab the relavent data to fill out the table
+
+foreach my $file ( @files ) {
+	open (FH, "<$ARGV[0]/$file" ) || die ;
+	my @data= <FH>;
+	$file =~ s/results_//g;
+	$file =~ s/_multiblup.txt.reml//g;
+	$file =~ m/(up_vs_down)_NAM_(.+)/;
+	my $pheno = $2;
+	my $status = $1;
+	$status =~ s/__/,/;
+	#$status = "[".$status.")";
+	chomp $data[10];
+	chomp $data[11];
+	$data[10] =~ s/\s+/\t/g;
+	$data[11] =~ s/\s+/\t/g;
+	print $pheno, "\t", $status , "\t" , "up regulated" , "\t",  $data[10] , "\n";
+	print $pheno, "\t", $status , "\t" , "down regulated" , "\t",  $data[11] , "\n";
+}# foreach
+
+exit;
+```
+
+
+### Developing a Genome Control
+
+It may be important to allow some of the variation to be "absorbed" by the rest of the genome, as only provideing a few SNPs (as is the case above) can $overfit$ the model. Thus, below I develop a method for controlling this over-fitting and introdiuce the use of paired random genes, which will be binned into up-regulated and down-regulated on a per pair bases. Furtermore, we will use an "all other" category so the model is:
+
+
+$y = SYN_{low} + SYN_{high} + random_{low} + random_{high} + rest$
+
+where $SYN$ stands for paired syntenic genes.
+
+We need to generate bedfiles for the $random_{low}$ and $random_{high}$ and the $rest$. 
+
+We also might want to consider how different in gene pairs are in terms of expression, and have some sort of cut-off value, below which genes are considered equally expressed. For example, restrict analysis to those syntenic pairs that are different in mean expression by 1.5 fold or more, for example.
+
+For each syntenic paralog pair we assess if the genes are expressed differently, discarding genes that are equally expressed (i.e. those with differences less than our threshold). Following this we then pick the same number of random gene pairs (excluding syntenic paralog pairs) thsat are differentailly expressed.
+
+The following code block is currently not evaluated. We have already generated our random set of genes, and want to preserve that record.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE, eval=FALSE}
+
+##############################################
+# Extract syntenic gene pairs that are "DGE" #
+##############################################
+
+# the required fold change
+fold<-1.5
+
+# variable to hold gene names, one for up-regultated, one for down regulated.
+upRegulated<-NULL
+downRegulated<-NULL
+# for each paralog pair ....
+for ( i in 1:dim(na.omit(subGenomes))[1] ) {
+  m1Name<-na.omit(subGenomes)[i,2]
+  m2Name<-na.omit(subGenomes)[i,3]
+  m1<-expAtlas$mean[expAtlas$Maize_AGPv2_gene == m1Name ]
+  m2<-expAtlas$mean[expAtlas$Maize_AGPv2_gene == m2Name ]
+  if ( m1 > m2*fold ) {
+    upRegulated<-c(upRegulated,as.character(m1Name))
+    downRegulated<-c(downRegulated,as.character(m2Name))
+  }# if
+    if ( m2 > m1*fold ) {
+    upRegulated<-c(upRegulated,as.character(m2Name))
+    downRegulated<-c(downRegulated,as.character(m1Name))
+  }# if
+}# for
+
+# output a bed file for up and down regulated.
+write.table(as.data.frame(subset(gff,subset=name %in% upRegulated & type == "gene"))[,1:3],quote=F, 
+            sep="\t", row.names=F, col.names=F, file = "/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/upRegulatedParalogs1.5.bed")
+# dito for down regulated
+write.table(as.data.frame(subset(gff,subset=name %in% downRegulated & type == "gene"))[,1:3],quote=F, 
+            sep="\t", row.names=F, col.names=F, file = "/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/downRegulatedParalogs1.5.bed")
+
+###############################################################################
+# Pick the same number of random gene pairs that are differentially expressed #
+###############################################################################
+
+# five times the number of 
+samplePairs<-sample.int(n=length(subset(gff,subset=!(name %in% c(upRegulated,downRegulated)) & name %in% expAtlas$Maize_AGPv2_gene & type == "gene")),
+                        size=5*length(downRegulated), replace=F)
+
+genePairs<-matrix(subset(gff,subset=!(name %in% c(upRegulated,downRegulated)) & name %in% expAtlas$Maize_AGPv2_gene  &  type == "gene" )$name[samplePairs],
+                  nrow=dim(genePairs)[1]/2, byrow=T)
+
+#now we have gene pairs in a matrix, check the expression of each gene pair and bin into up vs down regulated.
+# variable to hold gene names, one for up-regultated, one for down regulated.
+randomUp<-NULL
+randomDown<-NULL
+# for each paralog pair ....
+for ( i in 1:dim(genePairs)[1] ) {
+  name1<-genePairs[i,1]
+  name2<-genePairs[i,2]
+  # grab the mean expression
+  exp1<-expAtlas$mean[expAtlas$Maize_AGPv2_gene == name1 ]
+  exp2<-expAtlas$mean[expAtlas$Maize_AGPv2_gene == name2 ]
+  # add to the correct bin
+  if ( exp1 > exp2*fold ) {
+    randomUp<-c(randomUp,as.character(name1))
+    randomDown<-c(randomDown,as.character(name2))
+  }# if
+  if ( exp2 > exp1*fold ) {
+    randomUp<-c(randomUp,as.character(name2))
+    randomDown<-c(randomDown,as.character(name1))
+  }# if
+  # break if the number of gene pairs is equal in the random and syntenic classes
+  if ( length(randomUp) == length(upRegulated) ) break
+}# for
+
+####
+# Output a bedfile for each
+####
+
+# output a bed file for up and down regulated.
+write.table(as.data.frame(subset(gff,subset=name %in% randomUp & type == "gene"))[,1:3],quote=F, 
+            sep="\t", row.names=F, col.names=F, file = "/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/randomUp1.5.bed")
+# dito for down regulated
+write.table(as.data.frame(subset(gff,subset=name %in% randomDown & type == "gene"))[,1:3],quote=F, 
+            sep="\t", row.names=F, col.names=F, file = "/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/randomDown1.5.bed")
+
+###################################
+# Output the "rest" of the genome #
+###################################
+
+# return what isn't in our 4 groups
+restOfGenome<-gaps(c(subset(gff,subset=name %in% randomUp & type == "gene"),
+       subset(gff,subset=name %in% randomDown & type == "gene"),
+       subset(gff,subset=name %in% upRegulated & type == "gene"),
+       subset(gff,subset=name %in% downRegulated & type == "gene")))
+
+# output to a bedfile
+write.table(as.data.frame(restOfGenome)[,1:3],quote=F, 
+            sep="\t", row.names=F, col.names=F, file = "/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/restOfGenome.bed")
+
+```
+
+Now load in the pre-generated data, and examine the number of SNPs in each category:
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+randomUp<-read.table("/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/randomUp1.5.bed")
+colnames(randomUp)<-c("chr","start","end")
+
+randomDowm<-read.table("/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/randomDown1.5.bed")
+colnames(randomDowm)<-c("chr","start","end")
+
+restOfGenome<-read.table("/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/restOfGenome.bed")
+colnames(restOfGenome)<-c("chr","start","end")
+
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(randomUp,"GRanges")),"data.frame"))[1]," SNPs in random Up class"))
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(randomDowm,"GRanges")),"data.frame"))[1]," SNPs in random Down class"))
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(restOfGenome,"GRanges")),"data.frame"))[1]," SNPs in the rest of the genome"))
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(as.data.frame(subset(gff,subset=name %in% upRegulated & type == "gene"))[,1:3],"GRanges")),"data.frame"))[1]," SNPs in up Regulated paralog class"))
+print(paste0( "There are ", dim(as(subsetByOverlaps(as(NAM_snps,"GRanges"),as(as.data.frame(subset(gff,subset=name %in% downRegulated & type == "gene"))[,1:3],"GRanges")),"data.frame"))[1]," SNPs in down Regulated paralog class"))
+
+```
+
+The next step is to generate kinship matrices for each of our groups. This is done in the same manner as described above, but using the bedfiles we just created. Once done, the kinship matrices will be used to describe the variation in phenotype using LDAK (also described above). As a reminder the model we will use look like this:
+
+$y = SYN_{low} + SYN_{high} + random_{low} + random_{high} + rest$
+
+and is described as a list of relationship matrices, one for each of the terms in the model.
+
+##Results
+
+###Up regulated vs Down regulated paralogs.
+
+The data are in a single file and we can take a look at the results.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+############################
+# Load in the VCAP results #
+############################
+
+paralogH<-fread("/Users/simonrenny-byfield/GitHubRepos/cnvwin/HMMcopy/sub-genome/up_vs_Down/up_vs_down_H.txt", header=T, sep = "\t")
+
+paralogH$exp<-rep(c("rest","down","up","down","up"))
+paralogH$class<-rep(c("rest", "paralog","paralog","random","random"))
+
+```
+
+Next perform a binomial test on all the traits:
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+# exclude any traits that have lower than 40% total heritability and...
+H_by_pheno<-aggregate(paralogH$heritability,by=list(paralogH$pheno), "sum")
+
+# the rest of the genome category
+paralogH<-subset(paralogH,subset=pheno %in% H_by_pheno$Group.1 & group != "rest" )
+
+# some limits for error bars
+limitsCorrected <- aes(ymax = heritability + sd*1.96, ymin=heritability - sd*1.96)
+
+ggplot(paralogH,aes(x=group,y=heritability, colour=group))+
+  theme_bw()+
+  facet_wrap(~pheno, ncol = 5,scales = "free")+
+  geom_errorbar(limitsCorrected, size=1, width = 0.2, colour="black")+
+  geom_point(size=3)+
+  geom_point(size=2, colour="white")+
+  xlab("")+
+  ylab("Heritability")+
+  scale_colour_manual(values=c("blue","red","black","azure4"))+
+  theme(axis.title.x = element_text(size=17),
+          axis.title.y = element_text(size=15),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size=8),
+          legend.position="top",
+          legend.key.size=unit(0.8,"cm"),
+          legend.text=element_text(size=15),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0.5, 1, 0.5, 4), "mm"), #top, right, bottom, left
+          panel.margin = unit(c(0.1, 0.5, 0.1, 1), "mm"),
+          panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+  )
+
+succeses<-paralogH$heritability[paralogH$group == "paralog up"]-paralogH$heritability[paralogH$group == "paralog down"] > 0
+succeses<-length(succeses[succeses == TRUE])
+
+print(binom.test(succeses,length(paralogH$heritability[paralogH$group == "paralog up"]),p=0.5))
+
+# the rest of the genome category
+paralogH<-subset(paralogH,subset=pheno %in% H_by_pheno$Group.1[H_by_pheno$x>=0.4] & group != "rest" )
+
+## correct the "down" regualted genes, there are fewer SNPs in the up-reg genes
+#normFactor<-numDownSNPs/numUpSNPs
+#paralogH$correctedH<-paralogH$heritability
+#paralogH$correctedH[paralogH$expression == "up regulated"]<-paralogH$correctedH[paralogH$expression == "up regulated"]*normFactor
+
+#################
+# Plot the data #
+#################
+
+ggplot(paralogH,aes(x=group,y=heritability, colour=group))+
+  theme_bw()+
+  facet_wrap(~pheno, ncol = 5,scales = "free")+
+  geom_errorbar(limitsCorrected, size=1, width = 0.2, colour="black")+
+  geom_point(size=3)+
+  geom_point(size=2, colour="white")+
+  xlab("")+
+  ylab("Heritability")+
+  scale_colour_manual(values=c("blue","red","black","azure4"))+
+  theme(axis.title.x = element_text(size=17),
+          axis.title.y = element_text(size=15),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size=8),
+          legend.position="top",
+          legend.key.size=unit(0.8,"cm"),
+          legend.text=element_text(size=15),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0.5, 1, 0.5, 4), "mm"), #top, right, bottom, left
+          panel.margin = unit(c(0.1, 0.5, 0.1, 1), "mm"),
+          panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+  )
+
+ggplot(subset(paralogH,subset=pheno %in% limitedTraits),aes(x=group,y=heritability, colour=group))+
+  theme_bw()+
+  facet_wrap(~pheno, ncol = 5,scales = "free")+
+  geom_errorbar(limitsCorrected, size=1, width = 0.2, colour="black")+
+  geom_point(size=5)+
+  geom_point(size=2.5, colour="white")+
+  xlab("")+
+  ylab("Normalized Heritability")+
+  scale_colour_manual(values=c("red","blue","black","azure4"))+
+  theme(axis.title.x = element_text(size=17),
+          axis.title.y = element_text(size=15),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size=8),
+          legend.position="top",
+          legend.key.size=unit(0.8,"cm"),
+          legend.text=element_text(size=15),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0.5, 1, 0.5, 4), "mm"), #top, right, bottom, left
+          panel.margin = unit(c(0.1, 0.5, 0.1, 1), "mm"),
+          panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+  )
+
+```
+
+Now check out mean heritability per category.
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+
+ggplot(paralogH,aes(x=exp,y=heritability, fill=exp))+
+  theme_bw()+
+  facet_wrap(~class)+
+  #geom_jitter(size=3,alpha=0.6)+
+  geom_boxplot(alpha=0.9, size =1.4, colour="black")+
+  xlab("")+
+  ylab("Heritability")+
+  scale_colour_manual(values=c("red","blue","red","blue"))+
+  scale_fill_manual(values=c("red","blue","red","blue"))+
+  #scale_fill_brewer()+
+    theme(axis.title.x = element_text(size=17),
+          axis.title.y = element_text(size=20),
+          axis.text.x = element_blank(),
+          axis.text.y = element_text(size=20),
+          strip.text=element_text(size=20),
+          legend.position="top",
+          legend.key.size=unit(1.2,"cm"),
+          legend.text=element_text(size=15),
+          legend.title=element_blank(),
+          plot.margin = unit(c(0.5, 1, 0.5, 4), "mm"), #top, right, bottom, left
+          panel.margin = unit(c(0.1, 0.5, 0.1, 1), "mm"),
+          panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+  )
+
+```
+
+Next, perform a binomial test to see if "up regulated" paralogs "win" more often than you might expect by chance:
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+succeses<-paralogH$heritability[paralogH$group == "paralog up"]-paralogH$heritability[paralogH$group == "paralog down"] > 0
+succeses<-length(succeses[succeses == TRUE])
+
+print(binom.test(succeses,length(paralogH$heritability[paralogH$group == "paralog up"]),p=0.5))
+```
+
+Next, we examine if there is a difference between "wins" between Random Up and Random Down categories:
+
+```{r,echo=TRUE, warning=FALSE,message=FALSE}
+succeses<-paralogH$heritability[paralogH$group == "random up"]-paralogH$heritability[paralogH$group == "random down"] > 0
+succeses<-length(succeses[succeses == TRUE])
+
+print(binom.test(succeses,length(paralogH$heritability[paralogH$group == "random up"]),p=0.5))
+```
+
+Now lets see if the mean hertiability is different between the categories. First we need to examine for departure from normality, and then do an ANOVA.
+
+```{r}
+# looks normal but..
+hist(paralogH$heritability, breaks=15, col = "darkgrey")
+# test result indicates departure from normality.
+shapiro.test(paralogH$heritability)
+# not too much of a problem, becasue ANOVA can tolerate devaition from normality.
+
+# however we need to check for test for homogeneity of variances using a Bartlett test
+leveneTest(heritability~group,paralogH)
+
+# the yare not equal and so we need a Kruskal-Wallace test.
+print(kruskal.test(paralogH$heritability ~ as.factor(paralogH$group),data=paralogH))
+
+# now which levels of the factor are different?
+dunnResults<-dunnTest(paralogH$heritability ~ as.factor(paralogH$group),data=paralogH,
+         method="hochberg")
+print(dunnResults)
+
+```
